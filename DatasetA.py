@@ -1,23 +1,41 @@
-# read from parquet file
-df = spark.read.parquet("path/to/parquet_file")
-# drop duplicate entries 
-df_dedup = df.dropDuplicates(["detection_oid"])
-item_counts = (
-    df_dedup.groupBy("geographical_location_oid", "item_name")
-    .count()
-)
-# creating the dataset view 
-from pyspark.sql import Window
-from pyspark.sql.functions import col, row_number
+from pyspark.sql import SparkSession
 
-windowSpec = Window.partitionBy("geographical_location_oid").orderBy(col("count").desc())
+spark = SparkSession.builder.appName("TopItemsRDD").getOrCreate()
 
-ranked_items = item_counts.withColumn("rank", row_number().over(windowSpec))
+# Load parquet into DataFrame
+df = spark.read.parquet("path/to/parquet_file1")
 
-X = 5  # for example, top 5 items
-top_items = ranked_items.filter(col("rank") <= X)
+# Convert to RDD
+rdd = df.rdd
 
-# Show the items
-top_items.show(truncate=False)
+# Key by detection_oid
+dedup_rdd = rdd.keyBy(lambda row: row["detection_oid"]) \
+               .reduceByKey(lambda a, b: a) \
+               .map(lambda x: x[1])   # keep the row object
+# Count items
+item_counts_rdd = dedup_rdd.map(lambda row: (row["item_name"], 1))
+
+# To sum toptal counts per item
+item_totals_rdd = item_counts_rdd.reduceByKey(lambda a, b: a + b)
+
+# Sort by count descending and take top X (e.g. 10)
+top_x_items = item_totals_rdd.sortBy(lambda x: x[1], ascending=False).take(10)
+
+for item, count in top_x_items:
+    print(item, count)
+
+# Breakdown by Location
+location_item_counts_rdd = dedup_rdd.map(
+    lambda row: ((row["geographical_location_oid"], row["item_name"]), 1)
+).reduceByKey(lambda a, b: a + b)
+
+# Example: top 5 items per location
+top_items_per_location = location_item_counts_rdd \
+    .map(lambda x: (x[0][0], (x[0][1], x[1]))) \
+    .groupByKey() \
+    .mapValues(lambda items: sorted(items, key=lambda y: y[1], reverse=True)[:5])
+
+for loc, items in top_items_per_location.collect():
+    print(f"Location {loc}: {items}")
 
 
