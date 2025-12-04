@@ -1,0 +1,99 @@
+Sorting Strategies in Apache Spark
+1. Overview
+Sorting in Spark is a critical operation that affects performance during transformations such as groupBy, reduceByKey, and especially joins. Spark uses distributed sorting algorithms to organize data across partitions before shuffles. Understanding the strategies helps optimize jobs and avoid bottlenecks.
+
+2. Sorting Strategies
+a) Range Partitioning
+Data is partitioned into ranges based on key values.
+
+Ensures ordered distribution across partitions.
+
+Useful for range queries and global ordering.
+
+Downside: requires sampling to determine ranges, which can add overhead.
+
+b) Hash Partitioning
+Keys are hashed, and the hash determines the partition.
+
+Default strategy for most joins and aggregations.
+
+Provides even distribution if keys are uniform.
+
+Downside: skewed keys can cause imbalance.
+
+c) Sort-Merge Join (SMJ)
+Both datasets are sorted by join key, then merged.
+
+Efficient for large datasets when both sides are already sorted.
+
+Requires shuffle and sort on both sides.
+
+Commonly used when joining large parquet tables.
+
+d) Broadcast Hash Join (BHJ)
+One dataset (small enough to fit in memory) is broadcast to all executors.
+
+The larger dataset is scanned, and the join is performed locally.
+
+Extremely fast when one dataset is small (e.g., <10MB).
+
+Avoids shuffle for the smaller dataset.
+
+e) Shuffle Hash Join
+Both datasets are hashed and shuffled by join key.
+
+Works well when data fits in memory.
+
+Less efficient than SMJ for very large datasets.
+
+3. Strategy for Parquet File 1 and 2
+Dataset A (Parquet File 1): ~1 million rows (large).
+
+Dataset B (Parquet File 2): ~10,000 rows (small).
+
+Join Key: geographical_location_oid.
+
+Recommended Strategy: Broadcast Hash Join (BHJ)
+Dataset B is small enough to broadcast.
+
+Spark will automatically choose BHJ if spark.sql.autoBroadcastJoinThreshold is set appropriately (default ~10MB).
+
+This avoids shuffling Dataset A by join key, significantly speeding up the join.
+
+4. Spark Configuration Considerations
+Enable Broadcast Join:
+
+python
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # disable if needed
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 50 * 1024 * 1024)  # 50MB
+Skew Handling:
+
+If some geographical_location_oid values are heavily skewed, consider salting keys.
+
+Partition Tuning:
+
+Adjust spark.sql.shuffle.partitions (default 200) based on cluster size.
+
+5. Example Code Snippet (DataFrame Join)
+python
+df_a = spark.read.parquet("parquet_file_1")
+df_b = spark.read.parquet("parquet_file_2")
+
+# Broadcast the smaller dataset
+from pyspark.sql.functions import broadcast
+
+result = df_a.join(
+    broadcast(df_b),
+    on="geographical_location_oid",
+    how="inner"
+)
+6. Conclusion
+Spark offers multiple sorting and join strategies.
+
+For joining Parquet File 1 (~1M rows) with Parquet File 2 (~10K rows):
+
+Broadcast Hash Join is the optimal choice.
+
+It avoids expensive shuffles and leverages the small size of Dataset B.
+
+This ensures efficient computation and faster runtime in production.
