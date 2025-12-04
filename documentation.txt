@@ -1,0 +1,62 @@
+# Design Considerations and Spark Configurations
+## Project: Top X Items per Geographical Location (RDD-based PySpark Job)
+
+### 1. Problem Understanding
+- Dataset A (detections) contains ~1M rows with potential duplicate detection_oid values.
+- Dataset B (location metadata) contains ~10K rows mapping location IDs to human-readable names.
+- Requirement: Compute the top X items detected per geographical location, ensuring duplicates are not double-counted.
+- Output: Dataset C (Parquet) with columns:
+  - geographical_location_oid
+  - item_rank (1 = most popular item)
+  - item_name
+  - geographical_location (from Dataset B)
+
+### 2. Key Design Decisions
+- **RDD-based transformations**:
+  - Deduplication: Use detection_oid as key in RDD, reduceByKey to keep first occurrence.
+  - Counting: Map to ((location_oid, item_name), 1) and reduceByKey for counts.
+  - Ranking: GroupByKey per location, sort items by count descending, assign ranks.
+  - Top X filtering: Slice sorted list to top X items.
+  - Join: RDD join with location metadata keyed by geographical_location_oid.
+- **DataFrame API usage limited to I/O**:
+  - Read parquet files into DataFrames, convert to RDDs for processing.
+  - Convert final RDD back to DataFrame for parquet output.
+- **Flexibility**:
+  - Input/output paths and Top X parameter configurable via command-line arguments.
+- **Flake8 compliance**:
+  - Code style adheres to PEP8 (line length, docstrings, imports, naming conventions).
+
+### 3. Spark Configurations Proposed
+- **Master**: `local[*]` for development/testing; cluster mode for production.
+- **Executor Memory**: `--executor-memory 4G` (adjustable based on cluster resources).
+- **Driver Memory**: `--driver-memory 2G` for local testing.
+- **Parallelism**:
+  - `spark.sql.shuffle.partitions=200` (default tuning for groupByKey/reduceByKey).
+  - Adjust based on cluster size and dataset scale.
+- **Serialization**:
+  - `spark.serializer=org.apache.spark.serializer.KryoSerializer` for efficiency.
+- **Speculative Execution**:
+  - `spark.speculation=true` to mitigate straggler tasks.
+- **Checkpointing / Caching**:
+  - Deduplicated RDD may be cached if reused in multiple transformations.
+- **File Output**:
+  - `mode("overwrite")` ensures clean reruns.
+  - Parquet chosen for columnar efficiency and compatibility.
+
+### 4. Testing Strategy
+- **Unit Tests**:
+  - Deduplication correctness (duplicate detection_oid handled).
+  - Item counting accuracy.
+  - Ranking logic (descending order, correct rank assignment).
+  - Top X filtering.
+- **Integration Test**:
+  - End-to-end run with synthetic parquet datasets A & B.
+  - Validate output schema and values against expected results.
+
+### 5. Scalability Considerations
+- RDD transformations scale linearly with dataset size (~1M rows manageable).
+- Window functions avoided (DataFrame-only); ranking implemented via RDD sorting.
+- Joins optimized by ensuring Dataset B (10K rows) is small enough to broadcast.
+
+---
+
