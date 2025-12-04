@@ -1,0 +1,14 @@
+def test_top_x_filter(spark):
+    data = [
+        (1, "Car", 5),
+        (1, "Person", 3),
+        (1, "Dog", 2),
+    ]
+    df = spark.createDataFrame(data, ["geographical_location_oid", "item_name", "count"])
+
+    window_spec = Window.partitionBy("geographical_location_oid").orderBy(col("count").desc())
+    ranked = df.withColumn("item_rank", row_number().over(window_spec))
+    top_x = ranked.filter(col("item_rank") <= 2).collect()
+
+    assert len(top_x) == 2
+    assert {row["item_name"] for row in top_x} == {"Car", "Person"}
