@@ -1,0 +1,310 @@
+Streaming architecture design for real-time, deduplicated item insights
+This is a practical, production-ready design for storing, processing, and serving real-time join results between a high-throughput event stream (Dataset A) and a static reference table (Dataset B). It meets the requirements of zero duplicate counts, near–real-time availability, and dashboards that reflect the latest state.
+
+Objectives and constraints
+Throughput: ~10,000 events/second from edge cameras.
+
+Latency: Results should be queryable “as soon as events are published” — near real-time (sub‑seconds to a few seconds).
+
+Deduplication: Upstream duplicates can occur; count each detection_oid once.
+
+Static reference: Dataset B is small and unchanged; available for fast joins.
+
+Dashboard: Always-on, consistent view of deduplicated, joined results.
+
+Reference environment and tech stack
+I propose an Azure-centric stack, with AWS/GCP equivalents listed for portability.
+
+Ingestion (stream):
+
+Azure Event Hubs (Kafka-compatible), partitions sized for 10k events/s.
+
+Equivalents: AWS Kinesis | GCP Pub/Sub | Apache Kafka on-prem.
+
+Compute (stream processing):
+
+Azure Databricks (Spark Structured Streaming) for stateful, exactly-once dedup and stream-static joins.
+
+Alternatives: Spark on AKS/HDInsight | Flink | Kafka Streams (if JVM-only).
+
+Storage (lakehouse):
+
+Delta Lake on Azure Data Lake Gen2 for transactional, ACID tables, schema evolution, time travel, and upserts.
+
+Alternatives: Apache Hudi | Apache Iceberg (AWS/GCP).
+
+Serving layer for dashboards:
+
+Databricks SQL / Power BI (Direct Lake) for low-latency queries over Delta.
+
+Alternatives: Synapse Serverless | Azure SQL DB (for curated aggregates) | Presto/Trino.
+
+Metadata & governance:
+
+Unity Catalog (Databricks) or Purview for governance, lineage, RBAC.
+
+Monitoring and reliability:
+
+Azure Monitor + Databricks metrics, event hub consumer lag, structured streaming checkpoints, alerts.
+
+Why this stack:
+
+ACID and streaming upserts in Delta Lake keep deduped state consistent under high concurrency.
+
+Structured Streaming state stores + watermarking provide scalable, bounded dedup.
+
+Broadcast/static joins give stable low latency with small Dataset B.
+
+Direct Lake serving avoids ETL duplication while keeping dashboards fresh.
+
+Data model and storage layout
+Bronze (raw events, append-only):
+
+Path: lake/bronze/detections
+
+Schema: geographical_location_oid, video_camera_oid, detection_oid, item_name, timestamp_detected (epoch), event_ingest_ts.
+
+Partitioning: by date (event_ingest_ts_date) to manage retention and pruning.
+
+Silver (deduplicated events):
+
+Path: lake/silver/detections_dedup
+
+Dedup key: detection_oid (stateful dedup, see Processing section).
+
+Columns: same as bronze plus deduped_ts and dedup_flag.
+
+Gold (joined, query-ready):
+
+Path: lake/gold/detections_joined
+
+Columns: geographical_location_oid, geographical_location, detection_oid, item_name, timestamp_detected.
+
+Indexed via Z-Order on geographical_location_oid, item_name (Databricks), or clustering.
+
+Reference (Dataset B):
+
+Path: lake/ref/geographical_locations
+
+Small, static Delta table; cached/broadcast for joins.
+
+Processing pipeline (real-time)
+Ingestion and raw write
+Label: Event source
+
+Description: Cameras publish JSON events to Event Hubs; producer retries may cause duplicates.
+
+Label: Raw sink
+
+Description: Structured Streaming reads Event Hubs and writes to Bronze Delta with append-only semantics and checkpoints for exactly-once delivery.
+
+Stateful deduplication
+Label: Dedup strategy
+
+Description: Use streaming state (mapGroupsWithState/flatMapGroupsWithState) keyed by detection_oid; mark and drop already-seen events. Bound state with watermark on event time to evict old keys safely.
+
+Label: Watermark
+
+Description: Set watermark on timestamp_detected (converted to timestamp) e.g., 1–6 hours depending on clock skew and arrival delay.
+
+Stream-static join and enrichment
+Label: Join approach
+
+Description: Load Dataset B as a static/broadcast DataFrame from Delta; perform a stream-static join on geographical_location_oid. Cache DF_B in memory for fast lookups.
+
+Label: Output semantics
+
+Description: Write joined results to Gold Delta with append (events) and optional MERGE for downstream aggregates.
+
+Aggregations for dashboards (optional, near real-time)
+Label: Top X per location
+
+Description: Compute streaming aggregates per location and item_name. Store results in gold tables: top_items_by_location and overall_top_items.
+
+Label: Update mode
+
+Description: Use update/complete mode depending on aggregation type; micro-batch trigger tuned for SLA.
+
+Triggers and latency
+Label: Trigger config
+
+Description: Trigger availableNow for batch backfills; for production, Trigger.ProcessingTime("1s") or "500ms" if executor resources allow. Aim for end-to-end latency < 2–3 seconds.
+
+Pseudocode outline (Spark Structured Streaming)
+python
+# Read stream
+raw_stream = (
+    spark.readStream.format("eventhubs")
+    .options(event_hubs_options)
+    .load()
+)
+
+# Parse payload
+events = parse_json(raw_stream.value).select(
+    "geographical_location_oid",
+    "video_camera_oid",
+    "detection_oid",
+    "item_name",
+    to_timestamp(col("timestamp_detected") / 1000).alias("event_ts"),
+    current_timestamp().alias("ingest_ts"),
+)
+
+# Bronze write (append)
+bronze_query = (
+    events.writeStream
+    .format("delta")
+    .option("checkpointLocation", "chk/bronze/detections")
+    .option("path", "lake/bronze/detections")
+    .trigger(processingTime="1 second")
+    .start()
+)
+
+# Dedup with watermark
+deduped = (
+    events
+    .withWatermark("event_ts", "2 hours")
+    .dropDuplicates(["detection_oid"])
+)
+
+# Load and cache static reference
+df_b = spark.read.format("delta").load("lake/ref/geographical_locations")
+df_b_cached = broadcast(df_b.cache())
+
+# Stream-static join
+joined = (
+    deduped.join(df_b_cached, on="geographical_location_oid", how="left")
+)
+
+# Gold write (append)
+gold_query = (
+    joined.writeStream
+    .format("delta")
+    .option("checkpointLocation", "chk/gold/detections_joined")
+    .option("path", "lake/gold/detections_joined")
+    .outputMode("append")
+    .trigger(processingTime="1 second")
+    .start()
+)
+Deduplication considerations
+Label: Idempotency key
+
+Description: detection_oid must be globally unique across cameras; if not, use a composite key: geographical_location_oid + video_camera_oid + detection_oid.
+
+Label: Late arrivals
+
+Description: Watermark window must cover expected delays; events older than watermark may be dropped or routed to a quarantine table for reconciliation.
+
+Label: State size
+
+Description: Monitor and compact state; use incremental checkpoints and state store metrics. Consider TTL aligned to SLA and retention.
+
+Dashboard access patterns and performance
+Label: Serving method
+
+Description: Power BI Direct Lake or Databricks SQL connects directly to Gold Delta; materialize views for common queries (e.g., top X per location).
+
+Label: Partitioning and indexing
+
+Description: Partition gold tables by date and optionally geographical_location_oid; use Z-Order (Databricks) on join/filter columns; optimize files via auto-compaction and vacuum.
+
+Label: Concurrency
+
+Description: Delta ACID ensures readers see consistent snapshots while writers append; enable isolation via readOptimized endpoints if needed.
+
+Label: Caching
+
+Description: Cache small reference tables; avoid caching large, frequently updated fact tables.
+
+Operations, reliability, and security
+Label: Checkpointing
+
+Description: Dedicated checkpoint paths per stream; monitor progress, offsets, and state versions for recovery.
+
+Label: Speculative execution
+
+Description: Enable speculation to mitigate stragglers in micro-batches; tune shuffle partitions based on cluster size.
+
+Label: Backfills and replays
+
+Description: Maintain Bronze history to reprocess with new logic; use availableNow triggers to catch up safely.
+
+Label: CI/CD
+
+Description: Automate deployment with parameterized job configs; include data contract tests (schema, key uniqueness).
+
+Label: Security
+
+Description: RBAC via Unity Catalog; PII redaction if present; storage firewall and private endpoints for ADLS; managed identities for access.
+
+Key questions for the product manager and stakeholders
+Latency SLA: What is the acceptable end-to-end latency? Sub-second, 1s, or up to 5s?
+
+Dedup definition: Is detection_oid guaranteed unique? If not, what composite key should define uniqueness?
+
+Late data policy: How late can events arrive? Should late events be included or quarantined?
+
+Data retention: How long should Bronze/Silver/Gold be kept? Do we need time travel for auditing?
+
+Dashboard scope: What filters, drill-downs, and time windows are needed? Do we need cross-location comparisons?
+
+Top X logic: How should ties be handled? Are ranks by count only, or weighted by recency?
+
+Availability targets: What uptime SLO and recovery time objective (RTO) are expected?
+
+Schema evolution: Can new item types or fields appear? Should we enforce schema-on-write with contracts?
+
+Access patterns: Who queries the data (BI, APIs, batch jobs)? Do we need row-level security?
+
+Cost constraints: Preferred balance between compute size, frequency of aggregates, and caching?
+
+Compliance: Any data residency or governance constraints for storage and processing?
+
+Assumptions made
+Detection uniqueness: detection_oid (or a specified composite key) is the authoritative idempotency key.
+
+Reference stability: Dataset B is small (≤10k rows) and static or changes infrequently; we can broadcast/cache it.
+
+Clock skew: timestamp_detected is sourced at the edge and may have up to 1–2 hours of skew; watermark is set accordingly.
+
+Event delivery: Ingestion is at-least-once; the pipeline ensures exactly-once effects via dedup and ACID sinks.
+
+Scalability: Cluster autoscaling is available to meet burst throughput; partitions in Event Hubs/Kafka are configured to avoid bottlenecks.
+
+Alternative cloud mappings (brief)
+AWS: Kinesis → Spark on EMR | Glue → Delta Lake on S3 → Athena/Redshift + QuickSight.
+
+GCP: Pub/Sub → Spark on Dataproc → Delta Lake on GCS → BigQuery + Looker (Iceberg/Hudi as options).
+
+Proposed Spark configurations
+Label: Streaming trigger
+
+Description: processingTime = 1s (tune to SLA and stability).
+
+Label: Shuffle and parallelism
+
+Description: spark.sql.shuffle.partitions tuned to cluster cores (e.g., 200–800).
+
+Label: Broadcast threshold
+
+Description: spark.sql.autoBroadcastJoinThreshold = 50MB (ensure B is broadcast).
+
+Label: Serialization
+
+Description: KryoSerializer for performance.
+
+Label: Speculative execution
+
+Description: spark.speculation = true.
+
+Label: Delta optimizations
+
+Description: Optimize/auto-compaction enabled; vacuum retention aligned to compliance.
+
+Final notes
+This architecture delivers:
+
+Near real-time, deduplicated event processing at 10k events/s.
+
+Reliable, low-latency stream-static joins with a broadcasted reference table.
+
+ACID, query-ready gold tables for dashboards with consistent, up-to-date results.
